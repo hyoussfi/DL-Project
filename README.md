@@ -63,8 +63,8 @@ pillow>=8.0.0
 1. Clone this repository
 
 ```
-git clone https://github.com/yourusername/skin-disease-classification.git
-cd skin-disease-classification
+git clone https://github.com/hyoussfi/DL-Project
+cd DL-Project
 ```
 
 2. Install the required packages
@@ -97,6 +97,38 @@ python Results/MobileNetv3/main.py
 
 ```
 python Results/EfficientNet/main.py
+```
+### Predictions
+Place the skin image in the root folder and replace the path in the `inference.py` and run the following command.
+```
+python inference.py
+```
+
+Expected Output:
+```
+root@e5b9a0785544:/workspace/DL-Project# python inference.py
+Using device: cuda
+
+Loading CNN from: /workspace/DL-Project/Results/Base/skin_disease_cnn.pth
+
+CNN Predictions:
+1. Melanocytic Nevi (NV): 0.9313
+2. Atopic Dermatitis: 0.0576
+3. Benign Keratosis-like Lesions (BKL): 0.0048
+
+Loading MobileNetV3 from: /workspace/DL-Project/Results/MobileNetv3/best_skin_disease_mobilenetv3.pth
+
+MobileNetV3 Predictions:
+1. Melanocytic Nevi (NV): 0.9990
+2. Benign Keratosis-like Lesions (BKL): 0.0006
+3. Atopic Dermatitis: 0.0004
+
+Loading EfficientNet from: /workspace/DL-Project/Results/EfficientNet/best_skin_disease_efficientnetb0.pth
+
+EfficientNet Predictions:
+1. Melanocytic Nevi (NV): 0.9970
+2. Atopic Dermatitis: 0.0030
+3. Benign Keratosis-like Lesions (BKL): 0.0000
 ```
 
 ## Results
