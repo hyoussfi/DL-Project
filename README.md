@@ -198,4 +198,4 @@ This project acknowledges several important ethical considerations:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+The license file will be added later.
