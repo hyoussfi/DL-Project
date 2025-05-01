@@ -13,20 +13,30 @@ import seaborn as sns
 from torchvision import models
 import torch.nn.functional as F
 from collections import Counter
+from torchvision.models.efficientnet import SqueezeExcitation
+import sys
+from torch.optim.lr_scheduler import OneCycleLR
+
 
 """
 Author: oriaz3
 
 Code adopted from teammate (hyoussfi3@gatech). Following changes made by oriaz3...
-- Multi attention head class
 - compute_alpha_from_dataset to get class imblance sensitive alpha values for focal loss
 - Focal loss class 
+- Multi attention head class
 - alternative training and validation loops for adjusted loss function
 - some modifications to data augmentation in dataset loaders
 """
 
 
+sys.stdout = open('output.log', 'w', buffering=1)
+# sys.stdout = log_file
 
+print("This will go into output.log")
+
+
+        
 def compute_alpha_from_dataset(dataset, device=None):
     try:
         targets = dataset.targets
@@ -68,6 +78,47 @@ class FocalLoss(nn.Module):
 
         return loss.mean()
 
+
+class MultiHeadSelfAttention(nn.Module):
+    # Multi head self attention module with a reduction ratio for reducing attention vector sizes
+# and a pool kernel for reducing spatial size in beginnig . Keeps it containable in GPU memory.
+# Very similar to Assignment 3, Added reduction, pooling and 2dConv K, Q, V instead of Linear
+    def __init__(self, in_dim, num_heads=1, reduction_ratio=4, dropout=0.2, pool_kernel=2):
+        super(MultiHeadSelfAttention, self).__init__()
+        
+        self.num_heads = num_heads
+        self.reduced_dim = in_dim // reduction_ratio
+        self.head_dim = self.reduced_dim // num_heads
+        self.pool = nn.AvgPool2d(kernel_size=pool_kernel, stride=pool_kernel) if pool_kernel > 1 else nn.Identity()
+        self.qkv_proj = nn.Conv2d(in_dim, self.reduced_dim * 3, kernel_size=1)
+        self.out_proj = nn.Conv2d(self.reduced_dim, in_dim, kernel_size=1)
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        x_down = self.pool(x)
+        Hp, Wp = x_down.shape[2:]
+
+        qkv = self.qkv_proj(x_down) 
+        B, total_channels, Hp, Wp = qkv.shape
+        reduced_dim = total_channels // 3
+        head_dim = reduced_dim // self.num_heads
+        qkv = qkv.view(B, 3, self.num_heads, head_dim, Hp * Wp).permute(1, 0, 2, 4, 3) 
+
+        Q, K, V = qkv[0], qkv[1], qkv[2]
+
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / (head_dim ** 0.5)
+        attention_weights = self.softmax(attention_scores)
+        attention_weights = self.dropout(attention_weights)
+        attenuated_out = torch.matmul(attention_weights, V)
+
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, self.reduced_dim, Hp, Wp)
+        out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False) 
+        out = self.out_proj(out)
+
+        return out + x
 
 torch.manual_seed(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -154,16 +205,18 @@ def create_efficientnetb0_with_attention(num_classes, fine_tune=True):
                 param.requires_grad = False
                     
     for idx, block in enumerate(model.features):
-        if hasattr(block, 'block') and isinstance(block.block[1], nn.Sequential):
-            for inner_idx, layer in enumerate(block.block[1]):
-                if isinstance(layer, nn.SqueezeExcitation):
-                    in_channels = layer.fc1.in_features
-                    attention_layer = MultiHeadSelfAttention(in_channels, num_heads=1)
+        for name, submodule in block.named_modules():
+            if isinstance(submodule, SqueezeExcitation):
+                in_channels = submodule.fc1.in_channels
+                print(f"REPLACING SE at block {idx} ({name}) with in_channels={in_channels}")
+                attention = MultiHeadSelfAttention(in_channels, num_heads=1)
     
-                    for param in attention_layer.parameters():
-                        param.requires_grad = True
-    
-                    block.block[1][inner_idx] = attention_layer
+                # Replace in-place
+                parent_module = block
+                path = name.split('.')
+                for p in path[:-1]:
+                    parent_module = getattr(parent_module, p)
+                setattr(parent_module, path[-1], attention)
 
                     
     in_features = model.classifier[1].in_features 
@@ -200,17 +253,29 @@ model = create_efficientnetb0_with_attention(num_classes)
 model = model.to(device)
 
 normal_criterion = nn.CrossEntropyLoss()
-focal_gamma = 0.6
-focal_criterion = FocalLoss(gamma=5.0, alpha = compute_alpha_from_dataset(train_dataset, device=device), reduction='mean')
-optimizer = optim.AdamW([
-    {'params': [p for n, p in model.named_parameters() if 'classifier' not in n], 'lr': 0.00005},
-    {'params': model.classifier.parameters(), 'lr': 0.0005} 
-], weight_decay=1e-4) 
+focal_gamma = 0.5
+focal_criterion = FocalLoss(gamma=4.0, alpha = compute_alpha_from_dataset(train_dataset, device=device), reduction='mean')
+# optimizer = optim.AdamW([
+#     {'params': [p for n, p in model.named_parameters() if 'classifier' not in n], 'lr': 0.00005},
+#     {'params': model.classifier.parameters(), 'lr': 0.0005} 
+# ], weight_decay=1e-4) 
 
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6, verbose=True)
+# scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=5, min_lr=1e-6, verbose=True)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+
+scheduler = OneCycleLR(
+    optimizer,
+    max_lr=0.001,               
+    steps_per_epoch=len(train_loader),
+    epochs=25,
+    pct_start=0.2,
+    anneal_strategy='cos',
+    div_factor=10, 
+    final_div_factor=100
+)
 
 # Training function
-def train_model(model, normal_criterion, focal_gamma, focal_criterion, optimizer, scheduler, num_epochs=20):
+def train_model(model, normal_criterion, focal_gamma, focal_criterion, optimizer, scheduler, num_epochs=25):
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     best_val_acc = 0.0
     
@@ -308,50 +373,6 @@ plt.legend()
 plt.savefig('efficientnetb0_training_history.png')
 plt.show()
 
-# An implementation of multi head attention for conv2d Q, K and V layers. Adopt very similar attention weighting strategy to Assignment 3
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, in_dim, num_heads=1, dropout=0.2):
-        super(MultiHeadSelfAttention, self).__init__()
-
-        self.num_heads = num_heads
-        # ensembling of the heads - increase to regularize
-        self.head_dim = in_dim // num_heads
-
-        self.query_conv = nn.Conv2d(in_dim, in_dim, kernel_size=1)
-        self.key_conv = nn.Conv2d(in_dim, in_dim, kernel_size=1)
-        self.value_conv = nn.Conv2d(in_dim, in_dim, kernel_size=1)
-
-        self.out_proj = nn.Conv2d(in_dim, in_dim, kernel_size=1)
-        
-        self.softmax = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B, C, H, W = x.size()
-        
-        # Project inputs
-        query = self.query_conv(x).view(B, self.num_heads, self.head_dim, H * W)
-        key = self.key_conv(x).view(B, self.num_heads, self.head_dim, H * W)
-        value = self.value_conv(x).view(B, self.num_heads, self.head_dim, H * W)
-        
-        # Attention per head
-        query = query.permute(0, 1, 3, 2)
-        key = key.permute(0, 1, 2, 3)
-        value = value.permute(0, 1, 2, 3)
-
-        d_model = (self.head_dim ** (1/2))
-        attention_scores = torch.matmul(query, key) / d_model
-        attention_weights = self.softmax(attention)
-        attenuation = self.dropout(attention)
-        
-        out = torch.matmul(attenuation, value.permute(0, 1, 3, 2))
-        
-        out = out.permute(0, 1, 3, 2).contiguous()
-        out = out.view(B, C, H, W)
-        
-        out = self.out_proj(out)
-
-        return out + x
 
 # Evaluate the model
 def evaluate_model(model, data_loader, normal_criterion, focal_gamma, focal_criterion):
